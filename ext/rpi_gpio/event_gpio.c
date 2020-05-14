@@ -33,6 +33,8 @@ SOFTWARE.
 #include <string.h>
 #include <sys/time.h>
 #include "event_gpio.h"
+#include "ruby.h"
+#include "ruby/thread.h"
 
 const char *stredge[4] = {"none", "rising", "falling", "both"};
 
@@ -291,13 +293,20 @@ int callback_exists(unsigned int gpio)
     return 0;
 }
 
+static void *
+rb_run_callback(struct callback *cb)
+{
+  cb->func(cb->gpio);
+}
+
 void run_callbacks(unsigned int gpio)
 {
     struct callback *cb = callbacks;
+    rb_warn("Running callbacks...");
     while (cb != NULL)
     {
         if (cb->gpio == gpio)
-            cb->func(cb->gpio);
+            rb_thread_call_with_gvl(cb->func, gpio);
         cb = cb->next;
     }
 }
@@ -308,6 +317,7 @@ void remove_callbacks(unsigned int gpio)
     struct callback *temp;
     struct callback *prev = NULL;
 
+    rb_warn("Removing callbacks...");
     while (cb != NULL)
     {
         if (cb->gpio == gpio)
@@ -336,24 +346,29 @@ void *poll_thread(void *threadarg)
     int n;
 
     thread_running = 1;
+    rb_warn("polling thread...");
     while (thread_running) {
         if ((n = epoll_wait(epfd_thread, &events, 1, -1)) == -1) {
+          rb_warn("epol wait ending...");
             thread_running = 0;
             pthread_exit(NULL);
         }
         if (n > 0) {
             lseek(events.data.fd, 0, SEEK_SET);
             if (read(events.data.fd, &buf, 1) != 1) {
+              rb_warn("epol read ending...");
                 thread_running = 0;
                 pthread_exit(NULL);
             }
             g = get_gpio_from_value_fd(events.data.fd);
             if (g->initial_thread) {     // ignore first epoll trigger
+              rb_warn("ignoring first epoll trigger...");
                 g->initial_thread = 0;
             } else {
                 gettimeofday(&tv_timenow, NULL);
                 timenow = tv_timenow.tv_sec*1E6 + tv_timenow.tv_usec;
                 if (g->bouncetime == -666 || timenow - g->lastcall > g->bouncetime*1000 || g->lastcall == 0 || g->lastcall > timenow) {
+                  rb_warn("preparing to run callbacks...");
                     g->lastcall = timenow;
                     event_occurred[g->gpio] = 1;
                     run_callbacks(g->gpio);
@@ -413,19 +428,23 @@ void event_cleanup(unsigned int gpio)
     struct gpios *temp = NULL;
 
     while (g != NULL) {
-        if ((gpio == -666) || (g->gpio == gpio))
+        if ((gpio == -666) || (g->gpio == gpio)) {
             temp = g->next;
             remove_edge_detect(g->gpio);
             g = temp;
+        }
     }
-    if (gpio_list == NULL)
-        if (epfd_blocking != -1)
+    if (gpio_list == NULL) {
+        if (epfd_blocking != -1) {
             close(epfd_blocking);
             epfd_blocking = -1;
-        if (epfd_thread != -1)
+        }
+        if (epfd_thread != -1) {
             close(epfd_thread);
             epfd_thread = -1;
+        }
         thread_running = 0;
+    }
 }
 
 void event_cleanup_all(void)
@@ -482,6 +501,7 @@ int add_edge_detect(unsigned int gpio, unsigned int edge, int bouncetime)
            return 2;
         }
     }
+    rb_warn("Event detection added.");
     return 0;
 }
 

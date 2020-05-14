@@ -36,6 +36,7 @@ void Init_rpi_gpio()
   define_modules();
   define_gpio_module_stuff();
   define_pwm_class_stuff();
+  define_events_stuff();
 }
 
 void define_modules(void)

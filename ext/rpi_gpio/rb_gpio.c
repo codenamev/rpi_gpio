@@ -29,6 +29,16 @@ SOFTWARE.
 extern VALUE m_GPIO;
 int gpio_warnings = 1;
 
+struct rb_callback
+{
+  unsigned int gpio;
+  VALUE rb_cb;
+  unsigned long long lastcall;
+  unsigned int bouncetime;
+  struct rb_callback *next;
+};
+static struct rb_callback *rb_callbacks = NULL;
+
 VALUE _extract_channels(VALUE channel_or_list)
 {
     VALUE channel_list;
@@ -56,6 +66,9 @@ void define_gpio_module_stuff(void)
     rb_define_module_function(m_GPIO, "set_low", GPIO_set_low, 1);
     rb_define_module_function(m_GPIO, "high?", GPIO_test_high, 1);
     rb_define_module_function(m_GPIO, "low?", GPIO_test_low, 1);
+    rb_define_module_function(m_GPIO, "detect_event", GPIO_detect_event, 2);
+    rb_define_module_function(m_GPIO, "remove_event_detection", GPIO_remove_event_detect, 1);
+    rb_define_module_function(m_GPIO, "event_detected?", GPIO_event_detected, 1);
     rb_define_module_function(m_GPIO, "set_warnings", GPIO_set_warnings, 1);
 
     for (i = 0; i < 54; i++) {
@@ -131,6 +144,24 @@ int is_gpio_output(unsigned int gpio)
         }
 
         rb_raise(rb_eRuntimeError, "GPIO channel not setup as output");
+        return 0;
+    }
+
+    return 1;
+}
+
+int is_gpio_input(unsigned int gpio)
+{
+    if (gpio_direction[gpio] != INPUT) {
+        if (gpio_direction[gpio] != OUTPUT) {
+            rb_raise(rb_eRuntimeError,
+                "you must setup the GPIO channel first with "
+                "RPi::GPIO.setup CHANNEL, :as => :input or "
+                "RPi::GPIO.setup CHANNEL, :as => :output");
+            return 0;
+        }
+
+        rb_raise(rb_eRuntimeError, "GPIO channel not setup as input");
         return 0;
     }
 
@@ -381,6 +412,222 @@ VALUE GPIO_set_numbering(VALUE self, VALUE mode)
 
     gpio_mode = new_mode;
     return self;
+}
+
+static void run_rb_callbacks(unsigned int gpio)
+{
+  struct rb_callback *cb = rb_callbacks;
+  struct timeval tv_timenow;
+  unsigned long long timenow;
+  VALUE result;
+  int exception;
+
+  if (gpio_warnings)
+    rb_warn("running callbacks...");
+
+  while (cb != NULL)
+  {
+    if (cb->gpio == gpio) {
+      gettimeofday(&tv_timenow, NULL);
+      timenow = tv_timenow.tv_sec*1E6 + tv_timenow.tv_usec;
+      if (cb->bouncetime == 0 || timenow - cb->lastcall > cb->bouncetime*1001 || cb->lastcall == 0 || cb->lastcall > timenow) {
+        // run callback
+        rb_funcall(cb->rb_cb, rb_intern("call"), 0);
+        //result = rb_protect(rb_wrapped_callback, cb->rb_cb, &exception);
+        rb_warn("Callback performed");
+        if (exception) {
+          //fprintf(stderr, "Callback failed\n");
+          //rb_jump_tag(exception);
+          rb_raise(rb_eRuntimeError, "callback failed");
+        } else {
+          rb_warn("Callback success");
+          rb_iter_break();
+        }
+      }
+      cb->lastcall = timenow;
+    }
+    cb = cb->next;
+  }
+}
+
+static int add_rb_callback(unsigned int gpio, unsigned int bouncetime, VALUE cb_func)
+{
+  struct rb_callback *new_rb_cb;
+  struct rb_callback *cb = rb_callbacks;
+
+  // add callback to rb_callbacks list
+  new_rb_cb = malloc(sizeof(struct rb_callback));
+  if (new_rb_cb == 0)
+  {
+    rb_raise(rb_eNoMemError, "unable to add callback for event detection");
+    return -1;
+  }
+
+  new_rb_cb->rb_cb = cb_func;
+  new_rb_cb->gpio = gpio;
+  new_rb_cb->lastcall = 0;
+  new_rb_cb->bouncetime = bouncetime;
+  new_rb_cb->next = NULL;
+  if (rb_callbacks == NULL) {
+    rb_callbacks = new_rb_cb;
+  } else {
+    // add to end of list
+    while (cb->next != NULL)
+      cb = cb->next;
+    cb->next = new_rb_cb;
+  }
+  rb_warn("Adding edge callback from add_rb_callback...");
+  add_edge_callback(gpio, run_rb_callbacks);
+  if (gpio_warnings)
+    rb_warn("added callback");
+  return 0;
+}
+
+// RPi::GPIO.detect_event(channel, hash(:edge => {:rising, :falling, :both},
+// :bouncetime => Integer(default -666))
+// :callback => rb_block_proc(), &callback)
+//
+// sets up a listener with callback on a channel for the given edge with an optional
+// bouncetime
+VALUE GPIO_detect_event(VALUE self, VALUE channel, VALUE hash)
+{
+  unsigned int gpio;
+  int edge, result;
+  int bouncetime = 0;
+  const char *edge_str = NULL;
+  VALUE edge_val = Qnil;
+  VALUE bounce_val = Qnil;
+  VALUE callback = Qnil;
+
+  if (rb_block_given_p()) {
+    callback = rb_block_proc();
+  } else {
+    callback = rb_hash_aref(hash, ID2SYM(rb_intern("callback")));
+  }
+
+  if (NIL_P(callback)) {
+    rb_raise(rb_eArgError, "either a block or callback kwarg is required");
+    return Qnil;
+  }
+
+  if (get_gpio_number(NUM2INT(channel), &gpio))
+    return Qnil;
+
+  // check channel is set up as an input
+  if (!is_gpio_input(gpio)) {
+    rb_raise(rb_eRuntimeError, "you must setup() the GPIO channel as an input first");
+    return Qnil;
+  }
+
+  // is edge valid value
+  edge_val = rb_hash_aref(hash, ID2SYM(rb_intern("edge")));
+  if (edge_val != Qnil) {
+    edge_str = rb_id2name(rb_to_id(edge_val));
+    if (strcmp("rising", edge_str) == 0) {
+      edge = RISING_EDGE;
+    } else if (strcmp("falling", edge_str) == 0) {
+      edge = FALLING_EDGE;
+    } else if (strcmp("both", edge_str) == 0) {
+      edge = BOTH_EDGE;
+    } else {
+      rb_raise(rb_eArgError, "invalid edge; must be :rising, :falling, or :both");
+      return Qnil;
+    }
+  } else {
+    rb_raise(rb_eArgError, "you must specify an :edge; must be :rising, :falling, or :both");
+  }
+
+  if (check_gpio_priv()) {
+    rb_raise(rb_eArgError, "GPIO not priv yo...");
+    return Qnil;
+  }
+
+  bounce_val = rb_hash_aref(hash, ID2SYM(rb_intern("bouncetime")));
+  if (FIXNUM_P(bounce_val)) {
+    rb_warn("Updated bounce");
+    bouncetime = NUM2INT(bounce_val);
+  }
+
+  // starts a thread
+  if ((result = add_edge_detect(gpio, edge, bounce_val)) != 0) {
+    if (result == 1) {
+      rb_raise(rb_eRuntimeError, "edge detection already enabled for this GPIO channel");
+      return Qnil;
+    } else {
+      rb_raise(rb_eRuntimeError, "failed to add edge detection");
+      return Qnil;
+    }
+  }
+
+  if (callback != Qnil && add_rb_callback(gpio, bouncetime, callback) != 0) {
+    rb_warn("callback failed to add");
+    return Qnil;
+  }
+
+  if (gpio_warnings)
+    rb_warn("callback added...");
+
+  return self;
+}
+
+// RPi::GPIO.remove_event_detection(gpio)
+VALUE GPIO_remove_event_detect(VALUE self, VALUE channel)
+{
+  unsigned int gpio;
+  int chan = -1;
+  VALUE channel_list = _extract_channels(channel);
+  int chan_count = RARRAY_LEN(channel_list);
+  struct rb_callback *cb = rb_callbacks;
+  struct rb_callback *temp;
+  struct rb_callback *prev = NULL;
+
+  if (chan_count < 1) {
+    rb_raise(rb_eArgError, "a channel is required");
+    return Qnil;
+  }
+
+  for (int i = 0; i < chan_count; i++) {
+    chan = NUM2INT(rb_ary_entry(channel_list, i));
+    // ignore unregistered gpio channels
+    if (get_gpio_number(chan, &gpio))
+      continue;
+
+    // remove all ruby callbacks for gpio
+    while (cb != NULL)
+    {
+      if (cb->gpio == gpio)
+      {
+        if (prev == NULL)
+          rb_callbacks = cb->next;
+        else
+          prev->next = cb->next;
+        temp = cb;
+        cb = cb->next;
+        free(temp);
+      } else {
+        prev = cb;
+        cb = cb->next;
+      }
+    }
+
+    remove_edge_detect(gpio);
+  }
+
+  return self;
+}
+
+// RPi::GPIO.event_detected(channel)
+VALUE GPIO_event_detected(VALUE self, VALUE channel)
+{
+  unsigned int gpio;
+
+  if (get_gpio_number(NUM2INT(channel), &gpio))
+    return Qnil;
+
+  if (event_detected(gpio))
+    return Qtrue;
+  else
+    return Qfalse;
 }
 
 // RPi::GPIO.set_high(channel)

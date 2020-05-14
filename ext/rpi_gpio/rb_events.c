@@ -24,27 +24,11 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-#include "ruby.h"
-#include "c_gpio.h"
-#include "event_gpio.h"
-#include "cpuinfo.h"
-#include "common.h"
-#include "rb_pwm.h"
+#include "rb_events.h"
 
-void define_gpio_module_stuff(void);
-int mmap_gpio_mem(void);
-int is_gpio_initialized(unsigned int gpio);
-int is_gpio_output(unsigned int gpio);
-int is_rpi(void);
-VALUE GPIO_clean_up(int argc, VALUE *argv, VALUE self);
-VALUE GPIO_detect_event(VALUE self, VALUE channel, VALUE hash);
-VALUE GPIO_remove_event_detect(VALUE self, VALUE channel);
-VALUE GPIO_event_detected(VALUE self, VALUE channel);
-VALUE GPIO_reset(VALUE self);
-VALUE GPIO_setup(VALUE self, VALUE channel, VALUE hash);
-VALUE GPIO_set_numbering(VALUE self, VALUE mode);
-VALUE GPIO_set_high(VALUE self, VALUE channel);
-VALUE GPIO_set_low(VALUE self, VALUE channel);
-VALUE GPIO_test_high(VALUE self, VALUE channel);
-VALUE GPIO_test_low(VALUE self, VALUE channel);
-VALUE GPIO_set_warnings(VALUE self, VALUE setting);
+extern VALUE m_GPIO;
+
+void define_events_stuff(void)
+{
+  rb_struct_define_under(m_GPIO, "Event", "data", "events", NULL);
+}
